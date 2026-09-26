@@ -164,6 +164,54 @@ function AreaSelector({
         bounds
       );
     },
+    touchstart(event) {
+      if (!selecting) return;
+
+      map.dragging.disable();
+      setStart(event.latlng);
+      setCurrent(event.latlng);
+
+      event.originalEvent?.preventDefault?.();
+      event.originalEvent?.stopPropagation?.();
+    },
+
+    touchmove(event) {
+      if (!selecting || !start) return;
+
+      map.dragging.disable();
+      setCurrent(event.latlng);
+
+      event.originalEvent?.preventDefault?.();
+      event.originalEvent?.stopPropagation?.();
+    },
+
+    touchend(event) {
+      if (!selecting || !start) return;
+
+      const bounds = {
+        north: Math.max(start.lat, event.latlng.lat),
+        south: Math.min(start.lat, event.latlng.lat),
+        east: Math.max(start.lng, event.latlng.lng),
+        west: Math.min(start.lng, event.latlng.lng),
+      };
+
+      event.originalEvent?.preventDefault?.();
+      event.originalEvent?.stopPropagation?.();
+
+      setStart(null);
+      setCurrent(null);
+      map.dragging.enable();
+
+      if (
+        Math.abs(bounds.north - bounds.south) < 0.001 ||
+        Math.abs(bounds.east - bounds.west) < 0.001
+      ) {
+        return;
+      }
+
+      onSelected(bounds);
+    },
+
   });
 
   useEffect(() => {
