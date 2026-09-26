@@ -81,6 +81,7 @@ function AreaSelector({
     setCurrent,
   ] = useState(null);
 
+  const startRef = useRef(null);
   const map =
     useMap();
 
@@ -164,43 +165,76 @@ function AreaSelector({
         bounds
       );
     },
-    touchstart(event) {
-      if (!selecting) return;
+  });
 
-      map.dragging.disable();
-      setStart(event.latlng);
-      setCurrent(event.latlng);
-
-      event.originalEvent?.preventDefault?.();
-      event.originalEvent?.stopPropagation?.();
-    },
-
-    touchmove(event) {
-      if (!selecting || !start) return;
-
-      map.dragging.disable();
-      setCurrent(event.latlng);
-
-      event.originalEvent?.preventDefault?.();
-      event.originalEvent?.stopPropagation?.();
-    },
-
-    touchend(event) {
-      if (!selecting || !start) return;
-
-      const bounds = {
-        north: Math.max(start.lat, event.latlng.lat),
-        south: Math.min(start.lat, event.latlng.lat),
-        east: Math.max(start.lng, event.latlng.lng),
-        west: Math.min(start.lng, event.latlng.lng),
-      };
-
-      event.originalEvent?.preventDefault?.();
-      event.originalEvent?.stopPropagation?.();
-
+  useEffect(() => {
+    if (!selecting) {
+      startRef.current = null;
       setStart(null);
       setCurrent(null);
       map.dragging.enable();
+      return;
+    }
+
+    // Mobile browsers can let Leaflet's touch-pan handler consume the
+    // gesture before React/Leaflet touch events reach AreaSelector.
+    // Use native capture listeners on the actual map container so the
+    // selection gesture wins before Leaflet starts panning.
+    map.dragging.disable();
+
+    const container = map.getContainer();
+
+    const getLatLng = (touch) => {
+      const rect = container.getBoundingClientRect();
+      const x = touch.clientX - rect.left;
+      const y = touch.clientY - rect.top;
+      return map.containerPointToLatLng([x, y]);
+    };
+
+    const handleTouchStart = (event) => {
+      if (!event.touches || event.touches.length !== 1) return;
+
+      event.preventDefault();
+      event.stopPropagation();
+
+      const latlng = getLatLng(event.touches[0]);
+      startRef.current = latlng;
+      setStart(latlng);
+      setCurrent(latlng);
+    };
+
+    const handleTouchMove = (event) => {
+      if (!startRef.current || !event.touches || event.touches.length !== 1) return;
+
+      event.preventDefault();
+      event.stopPropagation();
+
+      const latlng = getLatLng(event.touches[0]);
+      setCurrent(latlng);
+    };
+
+    const handleTouchEnd = (event) => {
+      if (!startRef.current) return;
+
+      event.preventDefault();
+      event.stopPropagation();
+
+      const touch = event.changedTouches?.[0];
+      if (!touch) return;
+
+      const end = getLatLng(touch);
+      const begin = startRef.current;
+
+      const bounds = {
+        north: Math.max(begin.lat, end.lat),
+        south: Math.min(begin.lat, end.lat),
+        east: Math.max(begin.lng, end.lng),
+        west: Math.min(begin.lng, end.lng),
+      };
+
+      startRef.current = null;
+      setStart(null);
+      setCurrent(null);
 
       if (
         Math.abs(bounds.north - bounds.south) < 0.001 ||
@@ -210,30 +244,30 @@ function AreaSelector({
       }
 
       onSelected(bounds);
-    },
+    };
 
-  });
-
-  useEffect(() => {
-    // IMPORTANT: disable Leaflet's normal touch/pan gesture BEFORE the
-    // finger starts moving. Disabling it only inside touchstart is too late
-    // on some mobile browsers because Leaflet may already have started its
-    // own drag handler. This keeps normal map dragging when not selecting.
-    if (selecting) {
-      map.dragging.disable();
-    } else {
-      setStart(null);
-      setCurrent(null);
-      map.dragging.enable();
-    }
+    // capture=true is intentional: it prevents Leaflet's map drag handler
+    // from taking the same finger gesture.
+    container.addEventListener("touchstart", handleTouchStart, {
+      passive: false,
+      capture: true,
+    });
+    container.addEventListener("touchmove", handleTouchMove, {
+      passive: false,
+      capture: true,
+    });
+    container.addEventListener("touchend", handleTouchEnd, {
+      passive: false,
+      capture: true,
+    });
 
     return () => {
+      container.removeEventListener("touchstart", handleTouchStart, true);
+      container.removeEventListener("touchmove", handleTouchMove, true);
+      container.removeEventListener("touchend", handleTouchEnd, true);
       map.dragging.enable();
     };
-  }, [
-    selecting,
-    map,
-  ]);
+  }, [selecting, map, onSelected]);
 
   if (
     !start ||
