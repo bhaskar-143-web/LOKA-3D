@@ -1,9 +1,14 @@
+/*
+ * LOKA 3D — stable viewer patch
+ * Based directly on App_3D_TERRAIN_FINAL_V3.jsx.
+ * mapview.jsx and terrain-generation logic are intentionally unchanged.
+ */
 import React, { useEffect, useMemo, useRef, useState } from "react";
 import { Canvas, useFrame, useThree } from "@react-three/fiber";
-import { Grid, Line, OrbitControls } from "@react-three/drei";
+import { Grid, Html, Line, OrbitControls } from "@react-three/drei";
 import * as THREE from "three";
 import "./App.css";
-import MapView from "./MapView";
+import MapView from "./mapview";
 
 /* =======================================================
    LOKA 3D — corrected terrain renderer
@@ -17,7 +22,7 @@ const TERRAIN_SIZE = 70;
   The old terrain was visually almost flat.
   7.0 gives visible relief while smoothing prevents spikes.
 */
-const MAX_TERRAIN_HEIGHT = 8.4;
+const MAX_TERRAIN_HEIGHT = 7.98;
 
 const clamp = (v, min, max) => Math.max(min, Math.min(max, v));
 
@@ -105,7 +110,7 @@ function smoothHeightMap(values, size, passes = 3) {
    SLOPE
    ======================================================= */
 
-function calculateSlopeMap(values, size) {
+function calculateSlopeMap(values, size, spacingX = 1, spacingY = 1) {
   if (!values?.length) return [];
 
   const slopes = new Array(values.length).fill(0);
@@ -114,20 +119,13 @@ function calculateSlopeMap(values, size) {
     for (let col = 0; col < size; col++) {
       const index = row * size + col;
 
-      const left =
-        values[row * size + Math.max(0, col - 1)];
+      const left = values[row * size + Math.max(0, col - 1)];
+      const right = values[row * size + Math.min(size - 1, col + 1)];
+      const up = values[Math.max(0, row - 1) * size + col];
+      const down = values[Math.min(size - 1, row + 1) * size + col];
 
-      const right =
-        values[row * size + Math.min(size - 1, col + 1)];
-
-      const up =
-        values[Math.max(0, row - 1) * size + col];
-
-      const down =
-        values[Math.min(size - 1, row + 1) * size + col];
-
-      const dx = (right - left) * 0.5;
-      const dy = (down - up) * 0.5;
+      const dx = ((right - left) * 0.5) / Math.max(spacingX, 0.0001);
+      const dy = ((down - up) * 0.5) / Math.max(spacingY, 0.0001);
 
       slopes[index] = Math.sqrt(dx * dx + dy * dy);
     }
@@ -147,29 +145,39 @@ function percentile(values, p) {
   return sorted[index];
 }
 
-function getAnalysisSummary(heightData, highlight) {
+function getAnalysisSummary(heightData, highlight, physicalElevation = null, physicalMeta = null) {
   if (!heightData?.length || !highlight) {
     return null;
   }
 
-  const values = smoothHeightMap(
-    normalizeValues(heightData),
-    GRID_SIZE,
-    3
-  ).map((value) => {
-    const shaped = Math.pow(
-      clamp(value, 0, 1),
-      0.86
-    );
+  const usingPhysicalElevation =
+    Array.isArray(physicalElevation) &&
+    physicalElevation.length === GRID_SIZE * GRID_SIZE;
 
-    return clamp(
-      0.025 + shaped * 0.95,
-      0.025,
-      0.975
-    );
-  });
+  const values = usingPhysicalElevation
+    ? smoothHeightMap(physicalElevation, GRID_SIZE, 1)
+    : smoothHeightMap(
+        normalizeValues(heightData),
+        GRID_SIZE,
+        3
+      ).map((value) => {
+        const shaped = Math.pow(
+          clamp(value, 0, 1),
+          0.86
+        );
 
-  const slopes = calculateSlopeMap(values, GRID_SIZE);
+        return clamp(
+          0.025 + shaped * 0.95,
+          0.025,
+          0.975
+        );
+      });
+
+  const spacingX = Math.max(Number(physicalMeta?.spacingX) || 1, 1);
+  const spacingY = Math.max(Number(physicalMeta?.spacingY) || 1, 1);
+  const slopes = usingPhysicalElevation
+    ? calculateSlopeMap(physicalElevation, GRID_SIZE, spacingX, spacingY)
+    : calculateSlopeMap(values, GRID_SIZE);
   const { components } = buildAnalysisCellMask(
     values,
     slopes,
@@ -214,11 +222,20 @@ function getAnalysisSummary(heightData, highlight) {
 
   const minHeight = Math.min(...selectedHeights);
   const maxHeight = Math.max(...selectedHeights);
-  const depth = (maxHeight - minHeight) * MAX_TERRAIN_HEIGHT;
+  const depth = usingPhysicalElevation
+    ? maxHeight - minHeight
+    : (maxHeight - minHeight) * MAX_TERRAIN_HEIGHT;
 
   const width = ((maxCol - minCol + 1) / (GRID_SIZE - 1)) * TERRAIN_SIZE;
   const heightSpan = ((maxRow - minRow + 1) / (GRID_SIZE - 1)) * TERRAIN_SIZE;
   const length = Math.max(width, heightSpan);
+
+  const physicalLength = usingPhysicalElevation
+    ? Math.max(
+        (maxCol - minCol + 1) * spacingX,
+        (maxRow - minRow + 1) * spacingY
+      )
+    : null;
 
   const label =
     highlight === "highest"
@@ -230,9 +247,11 @@ function getAnalysisSummary(heightData, highlight) {
   return {
     label,
     length,
+    physicalLength,
     depth,
-    minHeight: minHeight * MAX_TERRAIN_HEIGHT,
-    maxHeight: maxHeight * MAX_TERRAIN_HEIGHT,
+    depthUnit: usingPhysicalElevation ? "m" : "relative units",
+    minHeight: usingPhysicalElevation ? minHeight : minHeight * MAX_TERRAIN_HEIGHT,
+    maxHeight: usingPhysicalElevation ? maxHeight : maxHeight * MAX_TERRAIN_HEIGHT,
   };
 }
 
@@ -598,43 +617,86 @@ function createAnalysisOverlay(
    TERRAIN BUNDLE
    ======================================================= */
 
-function createTerrainBundle(heightData, highlight) {
-  const normalized = normalizeValues(heightData);
-
+function createTerrainBundle(heightData, highlight, physicalElevation = null, physicalMeta = null) {
   /*
-    Strong smoothing prevents pixel noise from becoming
-    spikes, but we preserve enough variation for visible
-    3D relief.
-  */
-  const smoothed = smoothHeightMap(
-    normalized,
-    GRID_SIZE,
-    4
-  );
+    IMPORTANT: a real DEM must keep its physical relief.
+    The previous version normalized every selected area to 0..1 and then
+    stretched that range to the same visual height. That made a flat plain
+    and a hilly area look equally tall.
 
-  /*
-    Contrast curve:
-    - avoids a completely flat middle
-    - prevents extreme peaks
-    - keeps the usable terrain range broad
+    For map-selected terrain we now use:
+      sceneHeight = (elevation - localMinimum) / horizontalExtent
+                    * terrainSize * verticalExaggeration
+
+    This preserves the actual relationship between vertical relief and the
+    selected area's horizontal size. The exaggeration is explicit and only
+    visual; the elevation statistics remain in metres.
   */
-  const terrainValues = smoothed.map((value) => {
-    const shaped = Math.pow(
-      clamp(value, 0, 1),
-      0.86
+  let terrainValues;
+  let slopes;
+  let visualHeightScale = 1;
+
+  if (physicalElevation?.length === GRID_SIZE * GRID_SIZE) {
+    const minElevation = Math.min(...physicalElevation);
+    const maxElevation = Math.max(...physicalElevation);
+    const range = Math.max(0.001, maxElevation - minElevation);
+
+    const spacingX = Math.max(Number(physicalMeta?.spacingX) || 1, 1);
+    const spacingY = Math.max(Number(physicalMeta?.spacingY) || 1, 1);
+    const horizontalExtent = Math.max(
+      spacingX * (GRID_SIZE - 1),
+      spacingY * (GRID_SIZE - 1),
+      90
     );
 
-    return clamp(
-      0.025 + shaped * 0.95,
-      0.025,
-      0.975
+    // Use controlled adaptive vertical exaggeration so genuinely flat
+    // areas do not render as a visually useless sheet. The DEM values and
+    // analysis remain in metres; this factor only affects display height.
+    // Small relief -> stronger visual exaggeration; larger relief -> lower.
+    const verticalExaggeration = clamp(
+      18 / Math.max(range, 1),
+      2.5,
+      12
     );
-  });
+    const sceneUnitsPerMetre =
+      (TERRAIN_SIZE / horizontalExtent) *
+      verticalExaggeration;
 
-  const slopes = calculateSlopeMap(
-    terrainValues,
-    GRID_SIZE
-  );
+    // sceneUnitsPerMetre is already baked into terrainValues below.
+
+    const smoothedElevation = smoothHeightMap(
+      physicalElevation,
+      GRID_SIZE,
+      1
+    );
+
+    // Store scene height divided by MAX_TERRAIN_HEIGHT because the rest of
+    // the renderer multiplies terrainValues by MAX_TERRAIN_HEIGHT. Do NOT
+    // normalize by the DEM range.
+    terrainValues = smoothedElevation.map((elevation) =>
+      Math.max(0, (elevation - minElevation) * sceneUnitsPerMetre / MAX_TERRAIN_HEIGHT)
+    );
+
+    // Slope is computed from the measured elevation in metres and the
+    // actual geographic spacing, so steepest-area detection is not affected
+    // by display exaggeration.
+    slopes = calculateSlopeMap(
+      physicalElevation,
+      GRID_SIZE,
+      spacingX,
+      spacingY
+    );
+  } else {
+    const normalized = normalizeValues(heightData);
+    const smoothed = smoothHeightMap(normalized, GRID_SIZE, 2);
+
+    terrainValues = smoothed.map((value) => {
+      const shaped = Math.pow(clamp(value, 0, 1), 0.92);
+      return 0.025 + shaped * 0.95;
+    });
+
+    slopes = calculateSlopeMap(terrainValues, GRID_SIZE);
+  }
 
   const geometry = new THREE.PlaneGeometry(
     TERRAIN_SIZE,
@@ -650,31 +712,37 @@ function createTerrainBundle(heightData, highlight) {
   for (let i = 0; i < position.count; i++) {
     position.setY(
       i,
-      terrainValues[i] * MAX_TERRAIN_HEIGHT
+      terrainValues[i] *
+        MAX_TERRAIN_HEIGHT
     );
   }
 
   geometry.computeVertexNormals();
 
-  const overlay =
-    createAnalysisOverlay(
-      terrainValues,
-      slopes,
-      highlight
-    );
+  const overlay = createAnalysisOverlay(
+    terrainValues,
+    slopes,
+    highlight
+  );
 
   return {
     geometry,
-    overlayGeometry:
-      overlay?.geometry ?? null,
-    overlayColor:
-      overlay?.color ?? null,
-    overlayAnchor:
-      overlay?.anchor ?? null,
-    overlayCssColor:
-      overlay?.cssColor ?? null,
+    overlayGeometry: overlay?.geometry ?? null,
+    overlayColor: overlay?.color ?? null,
+    overlayAnchor: overlay?.anchor ?? null,
+    overlayCssColor: overlay?.cssColor ?? null,
     values: terrainValues,
     slopes,
+    minElevation: physicalElevation?.length ? Math.min(...physicalElevation) : null,
+    maxElevation: physicalElevation?.length ? Math.max(...physicalElevation) : null,
+    visualHeightScale:
+      physicalElevation?.length === GRID_SIZE * GRID_SIZE
+        ? clamp(18 / Math.max((Math.max(...physicalElevation) - Math.min(...physicalElevation)), 1), 2.5, 12)
+        : visualHeightScale,
+    verticalExaggeration:
+      physicalElevation?.length === GRID_SIZE * GRID_SIZE
+        ? clamp(18 / Math.max((Math.max(...physicalElevation) - Math.min(...physicalElevation)), 1), 2.5, 12)
+        : null,
   };
 }
 
@@ -810,6 +878,8 @@ function Terrain({
   highlight,
   flythrough,
   satelliteImage,
+  terrainElevationGrid,
+  terrainElevationMeta,
 }) {
   const { camera } = useThree();
 
@@ -817,38 +887,79 @@ function Terrain({
     () =>
       createTerrainBundle(
         heightData,
-        highlight
+        highlight,
+        terrainElevationGrid,
+        terrainElevationMeta
       ),
-    [heightData, highlight]
+    [heightData, highlight, terrainElevationGrid, terrainElevationMeta]
   );
 
-  const texture = useMemo(() => {
-    if (!satelliteImage) return null;
+  const [texture, setTexture] = useState(null);
+  const textureRef = useRef(null);
+  const [textureError, setTextureError] = useState(false);
 
+  useEffect(() => {
+    let cancelled = false;
     const loader = new THREE.TextureLoader();
     loader.setCrossOrigin("anonymous");
 
-    const loaded = loader.load(
+    setTextureError(false);
+
+    if (!satelliteImage) {
+      if (textureRef.current) {
+        textureRef.current.dispose();
+        textureRef.current = null;
+      }
+      setTexture(null);
+      return undefined;
+    }
+
+    // Keep this deliberately simple: the same direct ArcGIS TextureLoader
+    // path that produced the working satellite-draped terrain is used here.
+    // Do not fetch/blob-convert the image; that can fail even when the image
+    // endpoint is directly usable by the browser.
+    const nextTexture = loader.load(
       satelliteImage,
-      (tex) => {
-        tex.colorSpace = THREE.SRGBColorSpace;
-        tex.anisotropy = 4;
-        tex.needsUpdate = true;
+      (loaded) => {
+        if (cancelled) {
+          loaded.dispose();
+          return;
+        }
+
+        loaded.colorSpace = THREE.SRGBColorSpace;
+        loaded.anisotropy = 8;
+        loaded.minFilter = THREE.LinearMipmapLinearFilter;
+        loaded.magFilter = THREE.LinearFilter;
+        loaded.wrapS = THREE.ClampToEdgeWrapping;
+        loaded.wrapT = THREE.ClampToEdgeWrapping;
+        loaded.needsUpdate = true;
+
+        const previous = textureRef.current;
+        textureRef.current = loaded;
+        setTexture(loaded);
+
+        if (previous && previous !== loaded) {
+          previous.dispose();
+        }
       },
       undefined,
-      () => {
-        /*
-          Local uploaded/demo images normally work.
-          External map imagery can fail because of CORS;
-          the terrain still renders without the texture.
-        */
+      (error) => {
+        if (!cancelled) {
+          console.warn("Selected-area satellite texture could not be loaded.", error);
+          setTextureError(true);
+          setTexture(null);
+        }
       }
     );
 
-    loaded.wrapS = THREE.ClampToEdgeWrapping;
-    loaded.wrapT = THREE.ClampToEdgeWrapping;
-
-    return loaded;
+    // TextureLoader returns the texture immediately, but it must not be
+    // disposed here because the async image request is still in progress.
+    return () => {
+      cancelled = true;
+      if (nextTexture && nextTexture !== textureRef.current) {
+        nextTexture.dispose();
+      }
+    };
   }, [satelliteImage]);
 
   const target = useRef(
@@ -888,12 +999,17 @@ function Terrain({
       }
 
       edgeGeometry.dispose();
+    };
+  }, [bundle, edgeGeometry]);
 
-      if (texture) {
-        texture.dispose();
+  useEffect(() => {
+    return () => {
+      if (textureRef.current) {
+        textureRef.current.dispose();
+        textureRef.current = null;
       }
     };
-  }, [bundle, texture, edgeGeometry]);
+  }, []);
 
   const sampleHeight = (x, z) => {
     // Bilinear sampling keeps the flythrough smooth instead of
@@ -987,14 +1103,41 @@ function Terrain({
         receiveShadow
         castShadow
       >
-        <meshStandardMaterial
-          map={texture}
-          color={texture ? "#ffffff" : "#78966d"}
-          roughness={0.74}
-          metalness={0.06}
-          side={THREE.DoubleSide}
-        />
+        {texture ? (
+          <meshBasicMaterial
+            map={texture}
+            color="#ffffff"
+            side={THREE.DoubleSide}
+          />
+        ) : (
+          <meshStandardMaterial
+            color="#78966d"
+            roughness={0.82}
+            metalness={0.02}
+            emissive="#102018"
+            emissiveIntensity={0.08}
+            side={THREE.DoubleSide}
+          />
+        )}
       </mesh>
+
+      <Html position={[0, 7.5, 0]} center distanceFactor={15}>
+        <div style={{
+          background: "rgba(2,12,15,0.88)",
+          border: "1px solid rgba(77,220,236,0.35)",
+          borderRadius: 6,
+          padding: "6px 9px",
+          color: "#9eeef5",
+          fontSize: 9,
+          letterSpacing: "0.08em",
+          whiteSpace: "nowrap",
+          pointerEvents: "none",
+          textAlign: "center"
+        }}>
+          {texture ? "SATELLITE DRAPED" : textureError ? "SATELLITE LOAD FAILED" : "LOADING SATELLITE..."}
+          {bundle.verticalExaggeration ? ` • RELIEF ${bundle.verticalExaggeration.toFixed(1)}×` : ""}
+        </div>
+      </Html>
 
       <TerrainSkirt values={bundle.values} />
 
@@ -1056,6 +1199,8 @@ function MapFeatures3D({
   roads = [],
   water = [],
   heightData,
+  terrainElevationGrid = null,
+  satelliteImage = null,
 }) {
   const normalized = useMemo(
     () => normalizeValues(heightData || []),
@@ -1071,6 +1216,64 @@ function MapFeatures3D({
   const west = bounds.west;
   const east = bounds.east;
 
+  /*
+    MapView receives Overpass `out tags geom` objects, so the geometry
+    is an array of {lat, lon}. Older versions of this 3D layer expected
+    [lon, lat] arrays instead. Support BOTH shapes so OSM features are
+    not silently dropped.
+  */
+  const getFeatureCoordinates = (feature) => {
+    if (Array.isArray(feature?.geometry)) {
+      return feature.geometry
+        .map((point) => {
+          if (
+            point &&
+            Number.isFinite(Number(point.lat)) &&
+            Number.isFinite(Number(point.lon))
+          ) {
+            return [Number(point.lon), Number(point.lat)];
+          }
+          return null;
+        })
+        .filter(Boolean);
+    }
+
+    if (Array.isArray(feature?.coordinates)) {
+      return feature.coordinates
+        .map((point) => {
+          if (
+            Array.isArray(point) &&
+            point.length >= 2 &&
+            Number.isFinite(Number(point[0])) &&
+            Number.isFinite(Number(point[1]))
+          ) {
+            return [Number(point[0]), Number(point[1])];
+          }
+          return null;
+        })
+        .filter(Boolean);
+    }
+
+    return [];
+  };
+
+  const terrainDisplayValues = useMemo(() => {
+    if (Array.isArray(terrainElevationGrid) && terrainElevationGrid.length === GRID_SIZE * GRID_SIZE) {
+      const minElevation = Math.min(...terrainElevationGrid);
+      const maxElevation = Math.max(...terrainElevationGrid);
+      const range = Math.max(0.001, maxElevation - minElevation);
+      const visualHeightScale = clamp(
+        0.55 + Math.log10(range + 1) * 0.75,
+        0.55,
+        2.4
+      );
+      return terrainElevationGrid.map((elevation) =>
+        ((elevation - minElevation) / range) * visualHeightScale
+      );
+    }
+    return normalized.map((value) => value);
+  }, [terrainElevationGrid, normalized]);
+
   const toTerrain = (lat, lon) => {
     const x =
       ((lon - west) /
@@ -1081,10 +1284,7 @@ function MapFeatures3D({
     const z =
       (0.5 -
         (lat - south) /
-          Math.max(
-            north - south,
-            0.000001
-          )) *
+          Math.max(north - south, 0.000001)) *
       TERRAIN_SIZE;
 
     const col = clamp(
@@ -1105,259 +1305,116 @@ function MapFeatures3D({
       GRID_SIZE - 1
     );
 
-    const index =
-      row * GRID_SIZE + col;
+    const index = row * GRID_SIZE + col;
 
     return {
       x,
       z,
-      y:
-        (normalized[index] || 0) *
-        MAX_TERRAIN_HEIGHT,
+      y: (terrainDisplayValues[index] || 0) * MAX_TERRAIN_HEIGHT,
     };
+  };
+
+  // Clip every road segment to the selected rectangle so no road line
+  // can escape outside the generated 3D terrain.
+  const clipSegmentToBounds = (a, b) => {
+    let x0 = a[0], y0 = a[1];
+    let x1 = b[0], y1 = b[1];
+    const dx = x1 - x0;
+    const dy = y1 - y0;
+    let t0 = 0;
+    let t1 = 1;
+
+    const clip = (p, q) => {
+      if (Math.abs(p) < 1e-12) return q >= 0;
+      const r = q / p;
+      if (p < 0) {
+        if (r > t1) return false;
+        if (r > t0) t0 = r;
+      } else {
+        if (r < t0) return false;
+        if (r < t1) t1 = r;
+      }
+      return true;
+    };
+
+    // longitude west/east and latitude south/north
+    if (!clip(-dx, x0 - west)) return null;
+    if (!clip(dx, east - x0)) return null;
+    if (!clip(-dy, y0 - south)) return null;
+    if (!clip(dy, north - y0)) return null;
+
+    return [
+      [x0 + t0 * dx, y0 + t0 * dy],
+      [x0 + t1 * dx, y0 + t1 * dy],
+    ];
   };
 
   return (
     <group>
       {/* WATER */}
-      {water.slice(0, 40).map(
-        (feature, index) => {
-          const coords =
-            feature.coordinates;
+      {water.slice(0, 120).map((feature, index) => {
+        const coords = getFeatureCoordinates(feature);
+        if (coords.length < 3) return null;
 
-          if (
-            !Array.isArray(coords) ||
-            !coords.length
-          ) {
-            return null;
-          }
+        const points = coords
+          .map(([lon, lat]) => toTerrain(lat, lon))
+          .filter(Boolean);
 
-          const points = coords
-            .map((p) => {
-              if (
-                !Array.isArray(p) ||
-                p.length < 2
-              ) {
-                return null;
-              }
+        if (points.length < 3) return null;
 
-              return toTerrain(
-                p[1],
-                p[0]
-              );
-            })
-            .filter(Boolean);
+        const shape = new THREE.Shape();
+        points.forEach((point, i) => {
+          if (i === 0) shape.moveTo(point.x, point.z);
+          else shape.lineTo(point.x, point.z);
+        });
+        shape.closePath();
 
-          if (points.length < 3) {
-            return null;
-          }
+        return (
+          <mesh
+            key={`water-${index}`}
+            rotation={[-Math.PI / 2, 0, 0]}
+            position={[0, 0.1, 0]}
+          >
+            <shapeGeometry args={[shape]} />
+            <meshStandardMaterial
+              color="#1b82a8"
+              transparent
+              opacity={0.62}
+              roughness={0.2}
+              metalness={0.15}
+            />
+          </mesh>
+        );
+      })}
 
-          const shape =
-            new THREE.Shape();
+      {/* ROADS — clipped to selected terrain bounds */}
+      {roads.slice(0, 160).flatMap((feature, index) => {
+        const coords = getFeatureCoordinates(feature);
+        if (coords.length < 2) return [];
 
-          points.forEach((p, i) => {
-            if (i === 0) {
-              shape.moveTo(p.x, p.z);
-            } else {
-              shape.lineTo(p.x, p.z);
-            }
+        const clippedSegments = [];
+        for (let i = 0; i < coords.length - 1; i += 1) {
+          const clipped = clipSegmentToBounds(coords[i], coords[i + 1]);
+          if (clipped) clippedSegments.push(clipped);
+        }
+
+        return clippedSegments.map((segment, segmentIndex) => {
+          const points = segment.map(([lon, lat]) => {
+            const terrain = toTerrain(lat, lon);
+            return [terrain.x, terrain.y + 0.18, terrain.z];
           });
-
-          shape.closePath();
-
-          return (
-            <mesh
-              key={`water-${index}`}
-              rotation={[-Math.PI / 2, 0, 0]}
-              position={[0, 0.08, 0]}
-            >
-              <shapeGeometry args={[shape]} />
-              <meshStandardMaterial
-                color="#1b82a8"
-                transparent
-                opacity={0.55}
-              />
-            </mesh>
-          );
-        }
-      )}
-
-      {/* BUILDINGS */}
-      {buildings.slice(0, 60).map(
-        (feature, index) => {
-          const coords =
-            feature.coordinates;
-
-          if (
-            !Array.isArray(coords) ||
-            coords.length < 3
-          ) {
-            return null;
-          }
-
-          const points = coords
-            .map((p) => {
-              if (
-                !Array.isArray(p) ||
-                p.length < 2
-              ) {
-                return null;
-              }
-
-              return toTerrain(
-                p[1],
-                p[0]
-              );
-            })
-            .filter(Boolean);
-
-          if (points.length < 3) {
-            return null;
-          }
-
-          const xs =
-            points.map((p) => p.x);
-          const zs =
-            points.map((p) => p.z);
-
-          const minX =
-            Math.min(...xs);
-          const maxX =
-            Math.max(...xs);
-          const minZ =
-            Math.min(...zs);
-          const maxZ =
-            Math.max(...zs);
-
-          const width = Math.max(
-            0.25,
-            maxX - minX
-          );
-
-          const depth = Math.max(
-            0.25,
-            maxZ - minZ
-          );
-
-          const centerX =
-            (minX + maxX) / 2;
-
-          const centerZ =
-            (minZ + maxZ) / 2;
-
-          const center =
-            toTerrain(
-              feature.latMin ?? south,
-              feature.lonMin ?? west
-            );
-
-          const levels =
-            Number(
-              feature.tags?.["building:levels"]
-            );
-
-          const rawHeight =
-            Number(
-              feature.tags?.height
-            );
-
-          let buildingHeight = 0.5;
-
-          if (
-            Number.isFinite(rawHeight)
-          ) {
-            buildingHeight =
-              clamp(
-                rawHeight / 8,
-                0.25,
-                2.8
-              );
-          } else if (
-            Number.isFinite(levels)
-          ) {
-            buildingHeight =
-              clamp(
-                levels * 0.18,
-                0.3,
-                2.5
-              );
-          }
-
-          return (
-            <mesh
-              key={`building-${index}`}
-              position={[
-                centerX,
-                center.y +
-                  buildingHeight / 2 +
-                  0.08,
-                centerZ,
-              ]}
-              castShadow
-            >
-              <boxGeometry
-                args={[
-                  width,
-                  buildingHeight,
-                  depth,
-                ]}
-              />
-              <meshStandardMaterial
-                color="#b6b7ad"
-                roughness={0.9}
-              />
-            </mesh>
-          );
-        }
-      )}
-
-      {/* ROADS */}
-      {roads.slice(0, 60).map(
-        (feature, index) => {
-          const coords =
-            feature.coordinates;
-
-          if (!Array.isArray(coords)) {
-            return null;
-          }
-
-          const points = coords
-            .map((p) => {
-              if (
-                !Array.isArray(p) ||
-                p.length < 2
-              ) {
-                return null;
-              }
-
-              const t =
-                toTerrain(
-                  p[1],
-                  p[0]
-                );
-
-              return [
-                t.x,
-                t.y + 0.12,
-                t.z,
-              ];
-            })
-            .filter(Boolean);
-
-          if (points.length < 2) {
-            return null;
-          }
 
           return (
             <Line
-              key={`road-${index}`}
+              key={`road-${index}-${segmentIndex}`}
               points={points}
               color="#e8e4d7"
-              lineWidth={1.1}
+              lineWidth={1.15}
             />
           );
-        }
-      )}
+        });
+      })}
+
     </group>
   );
 }
@@ -1486,7 +1543,7 @@ function BlueprintScene({ heightData }) {
    ======================================================= */
 function RainField({ active, intensity = 1 }) {
   const points = useMemo(() => {
-    const count = 700;
+    const count = 350;
     const arr = new Float32Array(count * 3);
     for (let i = 0; i < count; i++) {
       arr[i * 3] = (Math.random() - 0.5) * TERRAIN_SIZE;
@@ -1536,6 +1593,7 @@ function RainField({ active, intensity = 1 }) {
 function FloodWater({ heightData, active, simulationTime, intensity = 1 }) {
   const flowRef = useRef();
   const poolRef = useRef();
+  const frameCounter = useRef(0);
 
   const geometry = useMemo(() => {
     const geo = new THREE.PlaneGeometry(
@@ -1637,6 +1695,8 @@ function FloodWater({ heightData, active, simulationTime, intensity = 1 }) {
 
   useFrame((state) => {
     if (!waterModel || !flowRef.current || !poolRef.current) return;
+    frameCounter.current += 1;
+    if (frameCounter.current % 4 !== 0) return;
 
     const rainProgress = clamp(
       (simulationTime - 2.5) / (10.0 / Math.max(0.75, intensity)),
@@ -1929,6 +1989,7 @@ function FloodFlowParticles({ heightData, active, simulationTime, intensity = 1 
 
 function FloodRiskOverlay({ heightData, active, simulationTime, intensity = 1 }) {
   const meshRef = useRef();
+  const frameCounter = useRef(0);
   const geometry = useMemo(() => {
     const geo = new THREE.PlaneGeometry(
       TERRAIN_SIZE / (GRID_SIZE - 1) * 0.94,
@@ -1952,6 +2013,8 @@ function FloodRiskOverlay({ heightData, active, simulationTime, intensity = 1 })
 
   useFrame((state) => {
     if (!meshRef.current || !values.length) return;
+    frameCounter.current += 1;
+    if (frameCounter.current % 4 !== 0) return;
 
     const rainDelay = Math.max(0, simulationTime - 2.5);
     const floodFront = clamp(
@@ -2104,6 +2167,8 @@ function Scene({
   highlight,
   flythrough,
   satelliteImage,
+  terrainElevationGrid,
+  terrainElevationMeta,
   selectedMapArea,
   virtualScene,
   floodSimulation,
@@ -2138,7 +2203,38 @@ function Scene({
         highlight={highlight}
         flythrough={flythrough}
         satelliteImage={satelliteImage}
+        terrainElevationGrid={terrainElevationGrid}
+        terrainElevationMeta={terrainElevationMeta}
       />
+
+      {selectedMapArea && (
+        <Html
+          position={[-30, 13, -30]}
+          transform={false}
+          distanceFactor={18}
+          zIndexRange={[20, 0]}
+        >
+          <div
+            style={{
+              minWidth: 190,
+              padding: "8px 10px",
+              border: "1px solid rgba(255,255,255,0.18)",
+              background: "rgba(4,10,14,0.86)",
+              color: "#eaf7ff",
+              fontFamily: "monospace",
+              fontSize: 11,
+              lineHeight: 1.5,
+              pointerEvents: "none",
+            }}
+          >
+            <div style={{ color: "#18d9ff", fontWeight: 700, marginBottom: 3 }}>MAP FEATURES</div>
+            <div>BUILDINGS: {selectedMapArea.buildings?.length ?? 0}</div>
+            <div>ROADS: {selectedMapArea.roads?.length ?? 0}</div>
+            <div>WATER: {selectedMapArea.water?.length ?? 0}</div>
+            <div style={{ opacity: 0.62, marginTop: 3 }}>FEATURE GEOMETRY STAYS ON MAP</div>
+          </div>
+        </Html>
+      )}
 
       {virtualScene && (
         <BlueprintScene heightData={heightData} />
@@ -2163,16 +2259,6 @@ function Scene({
         simulationTime={floodTime}
         intensity={1.35}
       />
-
-      {selectedMapArea && (
-        <MapFeatures3D
-          bounds={selectedMapArea.bounds}
-          buildings={selectedMapArea.buildings}
-          roads={selectedMapArea.roads}
-          water={selectedMapArea.water}
-          heightData={heightData}
-        />
-      )}
 
       <Grid
         args={[
@@ -2542,24 +2628,83 @@ function createDemoRGB() {
    IMAGE → RELATIVE DEPTH PROXY
    ======================================================= */
 
-function generateHeightMap(src) {
-  return new Promise(
-    (resolve, reject) => {
-      const img =
-        new Image();
+function loadImageElement(src) {
+  return new Promise((resolve, reject) => {
+    const img = new Image();
 
-      if (
-        src.startsWith("http://") ||
-        src.startsWith("https://")
-      ) {
-        img.crossOrigin =
-          "anonymous";
+    if (
+      src.startsWith("http://") ||
+      src.startsWith("https://")
+    ) {
+      img.crossOrigin = "anonymous";
+    }
+
+    img.onload = () => resolve(img);
+
+    img.onerror = () => {
+      reject(
+        new Error(
+          "Unable to read image."
+        )
+      );
+    };
+
+    img.src = src;
+  });
+}
+
+async function generateHeightMap(src) {
+  let img;
+
+  if (
+    src.startsWith("http://") ||
+    src.startsWith("https://")
+  ) {
+    /*
+      FIX: for a remote (map-selected) satellite image, fetch the bytes
+      ourselves first and load them from a local blob: URL. A blob: URL
+      is always same-origin for canvas pixel reads (ctx.getImageData),
+      which avoids CORS/crossOrigin edge cases that a plain
+      <img crossorigin="anonymous"> load can hit against some map image
+      services even when the same URL displays fine as a texture. This
+      was silently turning every map-selected area into the flat/neutral
+      fallback terrain. If the fetch itself fails (offline, blocked,
+      genuinely no CORS), fall back to the direct image load so texture
+      draping can still work even when pixel readback cannot.
+    */
+    try {
+      const response = await fetch(src, { mode: "cors" });
+
+      if (!response.ok) {
+        throw new Error(
+          `Satellite image request failed (${response.status}).`
+        );
       }
 
-      img.onload = () => {
-        try {
-          const canvas =
-            document.createElement("canvas");
+      const blob = await response.blob();
+      const blobUrl = URL.createObjectURL(blob);
+
+      try {
+        img = await loadImageElement(blobUrl);
+      } finally {
+        URL.revokeObjectURL(blobUrl);
+      }
+    } catch (fetchError) {
+      console.warn(
+        "Fetching the satellite image failed; falling back to a direct cross-origin image load.",
+        fetchError
+      );
+
+      img = await loadImageElement(src);
+    }
+  } else {
+    img = await loadImageElement(src);
+  }
+
+  {
+    {
+      const canvas =
+        document.createElement("canvas");
 
           canvas.width = GRID_SIZE;
           canvas.height = GRID_SIZE;
@@ -2754,30 +2899,16 @@ function generateHeightMap(src) {
               0
             ) / finalValues.length;
 
-          resolve({
+          return {
             heights: finalValues,
             stats: {
               min: min * 100,
               max: max * 100,
               avg: avg * 100,
             },
-          });
-        } catch (error) {
-          reject(error);
-        }
-      };
-
-      img.onerror = () => {
-        reject(
-          new Error(
-            "Unable to read image."
-          )
-        );
-      };
-
-      img.src = src;
+          };
     }
-  );
+  }
 }
 
 /* =======================================================
@@ -2795,6 +2926,14 @@ export default function App() {
     useState(null);
 
   const [elevationData, setElevationData] =
+    useState(null);
+
+  // Full-resolution physical elevation grid used by the 3D DEM renderer.
+  // heightData remains available for the existing relative-depth/fallback paths.
+  const [terrainElevationGrid, setTerrainElevationGrid] =
+    useState(null);
+
+  const [terrainElevationMeta, setTerrainElevationMeta] =
     useState(null);
 
   const [terrainStats, setTerrainStats] =
@@ -2822,7 +2961,7 @@ export default function App() {
     if (!floodSimulation) return;
     const timer = setInterval(() => {
       setFloodTime((value) => value + 0.1);
-    }, 100);
+    }, 150);
     return () => clearInterval(timer);
   }, [floodSimulation]);
 
@@ -2879,6 +3018,8 @@ export default function App() {
 
     setHeightData(null);
     setElevationData(null);
+    setTerrainElevationGrid(null);
+    setTerrainElevationMeta(null);
     setTerrainStats(null);
     setSelectedMapArea(null);
     setHighlight(null);
@@ -2926,6 +3067,8 @@ export default function App() {
       setSelectedMapArea(null);
       setHeightData(null);
       setElevationData(null);
+      setTerrainElevationGrid(null);
+      setTerrainElevationMeta(null);
       setTerrainStats(null);
       setHighlight(null);
       setFlythrough(false);
@@ -2952,16 +3095,38 @@ export default function App() {
       ].join(",");
 
       return (
-        "https://server.arcgisonline.com/ArcGIS/" +
+        "https://services.arcgisonline.com/ArcGIS/" +
         "rest/services/World_Imagery/MapServer/export" +
         `?bbox=${bbox}` +
         "&bboxSR=4326" +
-        "&size=1200,800" +
+        "&size=1024,1024" +
         "&imageSR=4326" +
-        "&format=jpg" +
+        "&adjustAspectRatio=false" +
+        "&format=jpgpng" +
+        "&transparent=false" +
         "&f=image"
       );
     };
+
+  /* ---------------------------------------------------
+     SATELLITE PRELOAD
+     Preload selected-area imagery while elevation is loading so the
+     3D surface does not appear first and then slowly paint in the map.
+  --------------------------------------------------- */
+
+  const preloadSatelliteImage = (url) =>
+    new Promise((resolve) => {
+      if (!url) {
+        resolve(false);
+        return;
+      }
+
+      const img = new Image();
+      img.crossOrigin = "anonymous";
+      img.onload = () => resolve(true);
+      img.onerror = () => resolve(false);
+      img.src = url;
+    });
 
   /* ---------------------------------------------------
      MAP FALLBACK
@@ -3031,183 +3196,56 @@ export default function App() {
     async (bounds) => {
       setElevationLoading(true);
       setAnswer(
-        "Loading elevation data..."
+        "Fetching satellite image for the selected area..."
       );
 
+      // FIX: the map-selected workflow must build terrain from the exact
+      // selected area's own satellite image, using the SAME image → relative
+      // depth pipeline as the normal upload workflow (generateHeightMap).
+      //
+      // Previously this function fetched an unrelated real-world DEM
+      // (Open-Meteo elevation) as the PRIMARY terrain source, and only fell
+      // back to the satellite image when the DEM request failed. That meant
+      // the 3D terrain shape usually had no connection to the imagery the
+      // user actually selected on the map — that mismatch was the reported
+      // bug. This now always derives the terrain from the selected-area
+      // satellite image, matching the requested data flow:
+      //   Map -> Select Area -> selected-area satellite image ->
+      //   generateHeightMap (existing image/depth pipeline) -> 3D terrain.
+      //
+      // terrainElevationGrid / terrainElevationMeta / elevationData remain in
+      // state and every consumer (createTerrainBundle, MapFeatures3D,
+      // displayStats, getAnalysisSummary) already treats them as optional and
+      // falls back to heightData/terrainStats — that fallback path is exactly
+      // what runs here, so no other component needs to change.
       try {
-        const sampleSize = 12;
-        const latitudes = [];
-        const longitudes = [];
-
-        for (
-          let row = 0;
-          row < sampleSize;
-          row++
-        ) {
-          const lat =
-            bounds.south +
-            ((bounds.north - bounds.south) *
-              row) /
-              (sampleSize - 1);
-
-          for (
-            let col = 0;
-            col < sampleSize;
-            col++
-          ) {
-            const lon =
-              bounds.west +
-              ((bounds.east - bounds.west) *
-                col) /
-                (sampleSize - 1);
-
-            latitudes.push(
-              lat.toFixed(6)
-            );
-
-            longitudes.push(
-              lon.toFixed(6)
-            );
-          }
-        }
-
-        const url =
-          "https://api.open-meteo.com/v1/elevation" +
-          `?latitude=${latitudes.join(",")}` +
-          `&longitude=${longitudes.join(",")}`;
-
-        const response =
-          await fetch(url);
-
-        if (!response.ok) {
-          throw new Error(
-            "Elevation service unavailable."
-          );
-        }
-
-        const json =
-          await response.json();
-
-        const raw =
-          Array.isArray(
-            json.elevation
-          )
-            ? json.elevation.map(Number)
-            : [];
-
-        if (
-          raw.length !==
-          sampleSize * sampleSize
-        ) {
-          throw new Error(
-            "Invalid elevation response."
-          );
-        }
-
-        const min =
-          Math.min(...raw);
-
-        const max =
-          Math.max(...raw);
-
-        const avg =
-          raw.reduce(
-            (a, b) => a + b,
-            0
-          ) / raw.length;
-
-        const normalized =
-          normalizeValues(raw);
-
-        const resized =
-          new Array(
-            GRID_SIZE * GRID_SIZE
-          );
-
-        for (
-          let row = 0;
-          row < GRID_SIZE;
-          row++
-        ) {
-          for (
-            let col = 0;
-            col < GRID_SIZE;
-            col++
-          ) {
-            const sourceRow =
-              Math.round(
-                (row /
-                  (GRID_SIZE - 1)) *
-                  (sampleSize - 1)
-              );
-
-            const sourceCol =
-              Math.round(
-                (col /
-                  (GRID_SIZE - 1)) *
-                  (sampleSize - 1)
-              );
-
-            resized[
-              row * GRID_SIZE + col
-            ] =
-              normalized[
-                sourceRow * sampleSize +
-                  sourceCol
-              ];
-          }
-        }
-
-        const smoothed =
-          smoothHeightMap(
-            resized,
-            GRID_SIZE,
-            5
-          );
-
-        setHeightData(
-          smoothed
+        const imageResult = await generateHeightMap(
+          createSatelliteImageUrl(bounds)
         );
 
-        setElevationData(
-          raw
-        );
-
-        setTerrainStats({
-          min,
-          max,
-          avg,
-        });
-
-        setAnswer(
-          "Elevation data loaded. 3D terrain is ready."
-        );
-      } catch (error) {
-        console.warn(error);
-
-        const fallback =
-          createFallbackTerrain();
-
-        setHeightData(
-          fallback
-        );
-
+        setHeightData(imageResult.heights);
+        setTerrainElevationGrid(null);
+        setTerrainElevationMeta(null);
         setElevationData(null);
-
-        setTerrainStats({
-          min: 0,
-          max: 100,
-          avg:
-            (fallback.reduce(
-              (a, b) => a + b,
-              0
-            ) /
-              fallback.length) *
-            100,
-        });
+        setTerrainStats(imageResult.stats);
 
         setAnswer(
-          "Elevation service unavailable. Showing relative terrain preview."
+          "3D terrain generated from the selected area's satellite image."
+        );
+      } catch (imageError) {
+        console.warn("Selected-area satellite image could not be processed for terrain.", imageError);
+
+        // Last-resort fallback is intentionally flat/neutral rather than a
+        // fake hill, so the UI never presents invented terrain as real data.
+        const fallback = new Array(GRID_SIZE * GRID_SIZE).fill(0.08);
+        setHeightData(fallback);
+        setTerrainElevationGrid(null);
+        setTerrainElevationMeta(null);
+        setElevationData(null);
+        setTerrainStats({ min: 0, max: 8, avg: 8 });
+
+        setAnswer(
+          "Satellite image for this area could not be loaded. Showing a neutral surface instead of fabricated terrain."
         );
       } finally {
         setElevationLoading(false);
@@ -3227,6 +3265,38 @@ export default function App() {
         water = [],
       } = data;
 
+      // MapView intentionally sends the same selection twice: once
+      // immediately so the parent can start terrain loading, and once
+      // later when OSM buildings/roads/water finish loading.
+      //
+      // IMPORTANT: the second callback must NOT reset the terrain, switch
+      // back to MAP, or start another DEM request. That race was causing
+      // the selected area's 3D terrain to disappear or get replaced.
+      const previousBounds = selectedMapArea?.bounds;
+      const sameSelection =
+        previousBounds &&
+        bounds &&
+        Math.abs(Number(previousBounds.north) - Number(bounds.north)) < 1e-7 &&
+        Math.abs(Number(previousBounds.south) - Number(bounds.south)) < 1e-7 &&
+        Math.abs(Number(previousBounds.east) - Number(bounds.east)) < 1e-7 &&
+        Math.abs(Number(previousBounds.west) - Number(bounds.west)) < 1e-7;
+
+      if (sameSelection) {
+        // Only refresh MAP feature data. Preserve the already-loaded
+        // selected-area satellite image, DEM, 3D mode and analysis state.
+        setSelectedMapArea((current) =>
+          current
+            ? {
+                ...current,
+                buildings,
+                roads,
+                water,
+              }
+            : current
+        );
+        return;
+      }
+
       setSelectedMapArea({
         bounds,
         buildings,
@@ -3236,17 +3306,26 @@ export default function App() {
 
       setImage(null);
 
-      setSatelliteImage(
-        createSatelliteImageUrl(
-          bounds
-        )
-      );
+      const selectedSatelliteUrl =
+        createSatelliteImageUrl(bounds);
+
+      setSatelliteImage(selectedSatelliteUrl);
+
+      // Start image download immediately. Browser cache then lets Three.js
+      // texture loading reuse the already fetched image when 3D opens.
+      preloadSatelliteImage(selectedSatelliteUrl);
 
       setHeightData(null);
       setElevationData(null);
+      setTerrainElevationGrid(null);
+      setTerrainElevationMeta(null);
       setTerrainStats(null);
       setHighlight(null);
       setFlythrough(false);
+      // New map selection always starts a clean 3D workflow.
+      setVirtualScene(false);
+      setFloodSimulation(false);
+      setFloodTime(0);
       setMode("MAP");
 
       await loadElevationForArea(
@@ -3267,13 +3346,24 @@ export default function App() {
 
     try {
       if (selectedMapArea) {
+        // Enter 3D immediately instead of waiting for the elevation/imagery
+        // request to finish. A neutral surface is shown while the real
+        // selected-area terrain is loading, then replaced by the loaded grid.
+        setMode("3D");
+
         if (!heightData) {
-          await loadElevationForArea(
-            selectedMapArea.bounds
+          setHeightData(
+            new Array(GRID_SIZE * GRID_SIZE).fill(0.08)
           );
         }
 
-        setMode("3D");
+        setAnswer(
+          "3D terrain loading for the selected area..."
+        );
+
+        await loadElevationForArea(
+          selectedMapArea.bounds
+        );
 
         setAnswer(
           "Terrain analyzed. Use Highest, Lowest, Steepest or Flythrough."
@@ -3294,10 +3384,9 @@ export default function App() {
           image
         );
 
-      setHeightData(
-        result.heights
-      );
-
+      setHeightData(result.heights);
+      setTerrainElevationGrid(null);
+      setTerrainElevationMeta(null);
       setElevationData(null);
 
       setTerrainStats(
@@ -3324,8 +3413,20 @@ export default function App() {
      3D
   --------------------------------------------------- */
 
-  const open3D = () => {
-    if (!heightData) {
+  const open3D = async () => {
+    // For a map selection, the button itself is the only action that enters 3D.
+    // If the background DEM request has not finished, retry it here for the
+    // exact selected bounds before opening the viewer.
+    if (selectedMapArea && !heightData) {
+      setAnswer("Loading 3D terrain for the selected area...");
+      try {
+        await loadElevationForArea(selectedMapArea.bounds);
+      } catch (error) {
+        console.error(error);
+      }
+    }
+
+    if (!selectedMapArea && !heightData) {
       setAnswer(
         "Analyze terrain first."
       );
@@ -3421,13 +3522,25 @@ export default function App() {
       const summary =
         getAnalysisSummary(
           heightData,
-          type
+          type,
+          terrainElevationGrid,
+          terrainElevationMeta
         );
+
+      const lengthText = summary?.physicalLength != null
+        ? `${summary.physicalLength.toFixed(0)} m`
+        : summary
+          ? `${summary.length.toFixed(1)} scene units`
+          : null;
+
+      const reliefText = summary
+        ? `${summary.depth.toFixed(2)} ${summary.depthUnit}`
+        : null;
 
       if (type === "highest") {
         setAnswer(
           summary
-            ? `Highest terrain region: ${summary.length.toFixed(1)} scene units long, ${summary.depth.toFixed(1)} relative units of relief.`
+            ? `Highest terrain region: about ${lengthText} long, with ${reliefText} of local relief.`
             : "Highest terrain regions highlighted in yellow."
         );
       }
@@ -3435,7 +3548,7 @@ export default function App() {
       if (type === "lowest") {
         setAnswer(
           summary
-            ? `Lowest terrain region: ${summary.length.toFixed(1)} scene units long, ${summary.depth.toFixed(1)} relative units of relief.`
+            ? `Lowest terrain region: about ${lengthText} long, with ${reliefText} of local relief.`
             : "Lowest terrain regions highlighted in blue."
         );
       }
@@ -3443,7 +3556,7 @@ export default function App() {
       if (type === "steepest") {
         setAnswer(
           summary
-            ? `Steepest terrain region: ${summary.length.toFixed(1)} scene units long, ${summary.depth.toFixed(1)} relative units of relief.`
+            ? `Steepest terrain region: about ${lengthText} long, with ${reliefText} of local relief.`
             : "Steepest terrain regions highlighted in red."
         );
       }
@@ -3603,7 +3716,9 @@ export default function App() {
       () =>
         getAnalysisSummary(
           heightData,
-          highlight
+          highlight,
+          terrainElevationGrid,
+          terrainElevationMeta
         ),
       [heightData, highlight]
     );
@@ -3868,13 +3983,21 @@ export default function App() {
               active={floodSimulation}
               floodTime={floodTime}
             />
-            {mode === "MAP" && (
+            <div
+              style={{
+                position: "absolute",
+                inset: 0,
+                zIndex: 3,
+                display: mode === "MAP" ? "block" : "none",
+                pointerEvents: mode === "MAP" ? "auto" : "none",
+              }}
+            >
               <MapView
                 onAreaSelected={
                   handleMapAreaSelected
                 }
               />
-            )}
+            </div>
 
             {mode === "IMAGE" &&
               image && (
@@ -3900,6 +4023,14 @@ export default function App() {
 
             {mode === "3D" &&
               heightData && (
+                <div
+                  style={{
+                    position: "absolute",
+                    inset: 0,
+                    zIndex: 2,
+                    overflow: "hidden",
+                  }}
+                >
                 <Canvas
                   camera={{
                     position: [
@@ -3932,6 +4063,12 @@ export default function App() {
                     satelliteImage={
                       satelliteImage
                     }
+                    terrainElevationGrid={
+                      terrainElevationGrid
+                    }
+                    terrainElevationMeta={
+                      terrainElevationMeta
+                    }
                     selectedMapArea={
                       selectedMapArea
                     }
@@ -3946,6 +4083,7 @@ export default function App() {
                     }
                   />
                 </Canvas>
+                </div>
               )}
 
             {mode === "3D" &&

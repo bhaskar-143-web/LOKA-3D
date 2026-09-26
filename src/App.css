@@ -81,10 +81,23 @@ button:disabled {
 }
 
 .brand-title {
-  color: #19d4ed;
-  font-size: 36px;
+  font-size: 34px;
   font-weight: 900;
-  letter-spacing: 8px;
+  letter-spacing: 2px;
+
+  background: linear-gradient(
+    90deg,
+    #8b5cf6 0%,
+    #a855f7 35%,
+    #3b82f6 70%,
+    #00bfff 100%
+  );
+
+  -webkit-background-clip: text;
+  -webkit-text-fill-color: transparent;
+  background-clip: text;
+
+  text-shadow: 0 0 18px rgba(91, 92, 255, 0.45);
 }
 
 .brand-subtitle {

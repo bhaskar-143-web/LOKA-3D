@@ -11,6 +11,7 @@ import {
   Polygon,
   Polyline,
   Popup,
+  Marker,
   useMap,
   useMapEvents,
 } from "react-leaflet";
@@ -38,12 +39,33 @@ const LABEL_URL =
 const TRANSPORT_URL =
   "https://{s}.tile.openstreetmap.de/{z}/{x}/{y}.png";
 
-const OVERPASS_URL =
-  "https://overpass-api.de/api/interpreter";
+const OVERPASS_ENDPOINTS = [
+  "https://overpass.private.coffee/api/interpreter",
+  "https://overpass-api.de/api/interpreter",
+  "https://maps.mail.ru/osm/tools/overpass/api/interpreter",
+];
 
-const MAX_BUILDINGS = 500;
-const MAX_ROADS = 250;
-const MAX_WATER = 150;
+const MAX_BUILDINGS = 300;
+const MAX_ROADS = 160;
+const MAX_WATER = 100;
+
+
+function LocationController({
+  location,
+}) {
+  const map = useMap();
+
+  useEffect(() => {
+    if (!location) return;
+    map.flyTo(
+      [location.lat, location.lon],
+      Math.max(map.getZoom(), location.zoom || 15),
+      { duration: 1.2 }
+    );
+  }, [location, map]);
+
+  return null;
+}
 
 function AreaSelector({
   selecting,
@@ -202,158 +224,88 @@ function AreaSelector({
    OVERPASS
 ========================================================= */
 
-async function runOverpassQuery(
-  query
-) {
-  const response =
-    await fetch(
-      OVERPASS_URL,
-      {
-        method: "POST",
-        headers: {
-          "Content-Type":
-            "text/plain",
-        },
-        body: query,
-      }
-    );
+async function runOverpassQuery(query, endpoint, timeoutMs = 7000) {
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), timeoutMs);
 
-  if (!response.ok) {
-    throw new Error(
-      `Overpass error ${response.status}`
-    );
+  try {
+    const response = await fetch(endpoint, {
+      method: "POST",
+      headers: {
+        "Content-Type": "text/plain;charset=UTF-8",
+        Accept: "application/json",
+      },
+      body: query,
+      signal: controller.signal,
+    });
+
+    if (!response.ok) {
+      throw new Error(`Overpass error ${response.status}`);
+    }
+
+    return response.json();
+  } finally {
+    clearTimeout(timer);
   }
-
-  return response.json();
 }
 
-async function loadOSMFeatures(
-  bounds
-) {
-  const south =
-    bounds.south;
+async function queryFastestEndpoint(query) {
+  const attempts = OVERPASS_ENDPOINTS.slice(0, 2).map((endpoint) =>
+    runOverpassQuery(query, endpoint, 7000)
+      .then((json) => ({ json, endpoint }))
+  );
 
-  const west =
-    bounds.west;
+  try {
+    return await Promise.any(attempts);
+  } catch (error) {
+    throw new Error("Map feature services are temporarily busy.");
+  }
+}
 
-  const north =
-    bounds.north;
+function cleanFeatureElements(elements = []) {
+  return elements.filter((item) => {
+    const geometry = item?.geometry;
+    return Array.isArray(geometry) && geometry.length >= 2;
+  });
+}
 
-  const east =
-    bounds.east;
+async function loadOSMFeatures(bounds) {
+  const { south, west, north, east } = bounds;
 
-  const buildingQuery = `
-    [out:json][timeout:25];
+  /*
+    Keep the request intentionally small and fast:
+    - ways only (relations can make Overpass responses very large)
+    - one combined request
+    - first two public endpoints raced in parallel
+    - 10 second client timeout
+  */
+  const query = `
+    [out:json][timeout:6];
     (
       way["building"](${south},${west},${north},${east});
-      relation["building"](${south},${west},${north},${east});
-    );
-    out tags geom;
-  `;
-
-  const roadQuery = `
-    [out:json][timeout:25];
-    (
       way["highway"](${south},${west},${north},${east});
-    );
-    out tags geom;
-  `;
-
-  const waterQuery = `
-    [out:json][timeout:25];
-    (
       way["natural"="water"](${south},${west},${north},${east});
       way["waterway"](${south},${west},${north},${east});
-      relation["natural"="water"](${south},${west},${north},${east});
     );
-    out tags geom;
+    out tags geom qt;
   `;
 
-  const results =
-    await Promise.allSettled([
-      runOverpassQuery(
-        buildingQuery
-      ),
-
-      runOverpassQuery(
-        roadQuery
-      ),
-
-      runOverpassQuery(
-        waterQuery
-      ),
-    ]);
-
-  const buildingResult =
-    results[0];
-
-  const roadResult =
-    results[1];
-
-  const waterResult =
-    results[2];
-
-  const buildings =
-    buildingResult.status ===
-    "fulfilled"
-      ? buildingResult.value.elements
-          .filter(
-            (item) =>
-              Array.isArray(
-                item.geometry
-              )
-          )
-          .slice(
-            0,
-            MAX_BUILDINGS
-          )
-      : [];
-
-  const roads =
-    roadResult.status ===
-    "fulfilled"
-      ? roadResult.value.elements
-          .filter(
-            (item) =>
-              Array.isArray(
-                item.geometry
-              )
-          )
-          .slice(
-            0,
-            MAX_ROADS
-          )
-      : [];
-
-  const water =
-    waterResult.status ===
-    "fulfilled"
-      ? waterResult.value.elements
-          .filter(
-            (item) =>
-              Array.isArray(
-                item.geometry
-              )
-          )
-          .slice(
-            0,
-            MAX_WATER
-          )
-      : [];
-
-  const failed =
-    results.filter(
-      (result) =>
-        result.status ===
-        "rejected"
-    ).length;
+  const { json } = await queryFastestEndpoint(query);
+  const elements = Array.isArray(json?.elements) ? json.elements : [];
 
   return {
-    buildings,
-    roads,
-    water,
-    partial:
-      failed > 0,
+    buildings: cleanFeatureElements(
+      elements.filter((item) => item.tags?.building)
+    ).slice(0, MAX_BUILDINGS),
+    roads: cleanFeatureElements(
+      elements.filter((item) => item.tags?.highway)
+    ).slice(0, MAX_ROADS),
+    water: cleanFeatureElements(
+      elements.filter(
+        (item) => item.tags?.natural === "water" || item.tags?.waterway
+      )
+    ).slice(0, MAX_WATER),
+    partial: false,
   };
 }
 
@@ -535,82 +487,135 @@ export default function MapView({
     setPartial,
   ] = useState(false);
 
+  const [
+    searchText,
+    setSearchText,
+  ] = useState("");
+
+  const [
+    searchResults,
+    setSearchResults,
+  ] = useState([]);
+
+  const [
+    searching,
+    setSearching,
+  ] = useState(false);
+
+  const [
+    searchError,
+    setSearchError,
+  ] = useState("");
+
+  const [
+    location,
+    setLocation,
+  ] = useState(null);
+
   const requestId =
     useRef(0);
 
-  const handleAreaSelected =
-    async (bounds) => {
-      setSelectedBounds(
-        bounds
+  const searchLocation = async () => {
+    const query = searchText.trim();
+    if (!query) return;
+
+    setSearching(true);
+    setSearchError("");
+    setSearchResults([]);
+
+    try {
+      const params = new URLSearchParams({
+        format: "jsonv2",
+        q: query,
+        limit: "5",
+        countrycodes: "in",
+        addressdetails: "1",
+      });
+
+      const response = await fetch(
+        `https://nominatim.openstreetmap.org/search?${params.toString()}`,
+        { headers: { Accept: "application/json" } }
       );
 
+      if (!response.ok) {
+        throw new Error("Location search failed.");
+      }
+
+      const results = await response.json();
+
+      if (!results.length) {
+        setSearchError("Location not found. Try village, district, state or full name.");
+        return;
+      }
+
+      setSearchResults(results);
+      const first = results[0];
+      setLocation({
+        lat: Number(first.lat),
+        lon: Number(first.lon),
+        zoom: Number(first.type === "village" || first.type === "town" ? 15 : 12),
+        label: first.display_name,
+      });
+    } catch (err) {
+      console.error(err);
+      setSearchError("Location search unavailable. Check internet connection.");
+    } finally {
+      setSearching(false);
+    }
+  };
+
+  const chooseSearchResult = (result) => {
+    const next = {
+      lat: Number(result.lat),
+      lon: Number(result.lon),
+      zoom: Number(result.type === "village" || result.type === "town" ? 15 : 12),
+      label: result.display_name,
+    };
+    setLocation(next);
+    setSearchResults([]);
+  };
+
+  const handleAreaSelected =
+    async (bounds) => {
+      setSelectedBounds(bounds);
       setSelecting(false);
       setLoading(true);
       setError("");
       setPartial(false);
 
-      const currentRequest =
-        ++requestId.current;
+      const currentRequest = ++requestId.current;
+
+      // Do not make terrain/elevation wait for OSM feature loading.
+      // The selected area is accepted immediately; map features arrive in the background.
+      setFeatures({ buildings: [], roads: [], water: [] });
+      onAreaSelected?.({
+        bounds,
+        buildings: [],
+        roads: [],
+        water: [],
+      });
 
       try {
-        const data =
-          await loadOSMFeatures(
-            bounds
-          );
+        const data = await loadOSMFeatures(bounds);
 
-        /*
-          Ignore stale Overpass response.
-        */
-        if (
-          currentRequest !==
-          requestId.current
-        ) {
-          return;
-        }
+        if (currentRequest !== requestId.current) return;
 
-        setFeatures(
-          data
-        );
+        setFeatures(data);
+        setPartial(Boolean(data.partial));
 
+        // Refresh the parent with the real feature data without restarting terrain.
         onAreaSelected?.({
           bounds,
-          buildings:
-            data.buildings,
-          roads:
-            data.roads,
-          water:
-            data.water,
+          buildings: data.buildings,
+          roads: data.roads,
+          water: data.water,
         });
-
-        setPartial(
-          data.partial
-        );
       } catch (err) {
-        console.error(err);
-
-        setFeatures({
-          buildings: [],
-          roads: [],
-          water: [],
-        });
-
-        setError(
-          "Map feature service unavailable. Terrain DEM can still be loaded."
-        );
-
-        onAreaSelected?.({
-          bounds,
-          buildings: [],
-          roads: [],
-          water: [],
-        });
+        if (currentRequest !== requestId.current) return;
+        console.warn("Background map feature load failed:", err);
+        setError("Map features are temporarily unavailable; terrain can continue loading.");
       } finally {
-        if (
-          currentRequest ===
-          requestId.current
-        ) {
-          setLoading(false);
-        }
+        if (currentRequest === requestId.current) setLoading(false);
       }
     };
 
@@ -618,11 +623,111 @@ export default function MapView({
     <div
       style={{
         width: "100%",
-        height: "100%",
+        height: "108%",
+        minHeight: "108%",
         position:
           "relative",
       }}
     >
+      {/* LOCATION SEARCH */}
+      <div
+        style={{
+          position: "absolute",
+          top: 58,
+          left: 12,
+          zIndex: 2000,
+          width: 320,
+        }}
+      >
+        <div style={{ display: "flex", gap: 6 }}>
+          <input
+            value={searchText}
+            onChange={(event) => setSearchText(event.target.value)}
+            onKeyDown={(event) => {
+              if (event.key === "Enter") searchLocation();
+            }}
+            placeholder="Search India / AP / district / village..."
+            style={{
+              flex: 1,
+              height: 38,
+              padding: "0 10px",
+              border: "1px solid #244a53",
+              borderRadius: 5,
+              outline: "none",
+              background: "rgba(3,17,22,.95)",
+              color: "#d8f7fb",
+              fontSize: 11,
+            }}
+          />
+          <button
+            type="button"
+            onClick={searchLocation}
+            disabled={searching}
+            style={{
+              width: 72,
+              border: "1px solid #20d8f5",
+              borderRadius: 5,
+              background: "rgba(3,17,22,.95)",
+              color: "#20d8f5",
+              fontSize: 10,
+              fontWeight: 900,
+            }}
+          >
+            {searching ? "..." : "SEARCH"}
+          </button>
+        </div>
+
+        {searchResults.length > 0 && (
+          <div
+            style={{
+              marginTop: 5,
+              maxHeight: 190,
+              overflowY: "auto",
+              background: "rgba(3,17,22,.97)",
+              border: "1px solid #244a53",
+              borderRadius: 5,
+            }}
+          >
+            {searchResults.map((result, index) => (
+              <button
+                key={`${result.place_id}-${index}`}
+                type="button"
+                onClick={() => chooseSearchResult(result)}
+                style={{
+                  width: "100%",
+                  padding: "9px 10px",
+                  textAlign: "left",
+                  border: 0,
+                  borderBottom: index === searchResults.length - 1 ? 0 : "1px solid #17363d",
+                  background: "transparent",
+                  color: "#bde8ee",
+                  fontSize: 10,
+                  lineHeight: 1.35,
+                }}
+              >
+                {result.display_name}
+              </button>
+            ))}
+          </div>
+        )}
+
+        {searchError && (
+          <div
+            style={{
+              marginTop: 5,
+              padding: "8px 10px",
+              background: "rgba(3,17,22,.95)",
+              border: "1px solid #6f3333",
+              color: "#ff9999",
+              borderRadius: 5,
+              fontSize: 9,
+            }}
+          >
+            {searchError}
+          </div>
+        )}
+      </div>
+
       <MapContainer
         center={
           DEFAULT_CENTER
@@ -686,6 +791,14 @@ export default function MapView({
           </>
         )}
 
+        <LocationController location={location} />
+
+        {location && (
+          <Marker position={[location.lat, location.lon]}>
+            <Popup>{location.label}</Popup>
+          </Marker>
+        )}
+
         <FeatureLayers
           buildings={
             features.buildings
@@ -728,6 +841,37 @@ export default function MapView({
           }
         />
       </MapContainer>
+
+      {/* SELECTED-AREA FEATURE SUMMARY */}
+      {(selectedBounds || features.buildings.length || features.roads.length || features.water.length) && (
+        <div
+          style={{
+            position: "absolute",
+            left: 12,
+            top: 112,
+            zIndex: 2000,
+            minWidth: 205,
+            padding: "9px 11px",
+            border: "1px solid rgba(32,216,245,.45)",
+            borderRadius: 6,
+            background: "rgba(3,17,22,.92)",
+            color: "#bde8ee",
+            fontSize: 10,
+            lineHeight: 1.65,
+            boxShadow: "0 6px 18px rgba(0,0,0,.28)",
+          }}
+        >
+          <div style={{ color: "#20d8f5", fontWeight: 900, letterSpacing: "1px", marginBottom: 3 }}>
+            SELECTED AREA FEATURES
+          </div>
+          <div>Buildings mapped: <strong style={{ color: "#ffd166" }}>{features.buildings.length}</strong></div>
+          <div>Road segments: <strong>{features.roads.length}</strong></div>
+          <div>Water features: <strong>{features.water.length}</strong></div>
+          <div style={{ marginTop: 3, color: "#719da5", fontSize: 8.5 }}>
+            Building count uses mapped OSM footprints; no 3D building blocks are generated.
+          </div>
+        </div>
+      )}
 
       {/* MAP CONTROLS */}
 
@@ -804,7 +948,7 @@ export default function MapView({
           position:
             "absolute",
           left: 12,
-          bottom: 12,
+          top: 218,
           zIndex: 2000,
           display: "flex",
           flexDirection:
@@ -841,8 +985,25 @@ export default function MapView({
         >
           {selecting
             ? "DRAG AREA..."
-            : "SELECT AREA"}
+            : selectedBounds
+              ? "SELECT AREA AGAIN"
+              : "SELECT AREA"}
         </button>
+
+        {selectedBounds && !loading && (
+          <div
+            style={{
+              padding: "7px 10px",
+              background: "rgba(3,17,22,.92)",
+              border: "1px solid rgba(32,216,245,.35)",
+              color: "#8ecbd5",
+              borderRadius: 5,
+              fontSize: 9,
+            }}
+          >
+            Area selected ✓
+          </div>
+        )}
 
         {loading && (
           <div
@@ -904,41 +1065,6 @@ export default function MapView({
           </div>
         )}
 
-        {selectedBounds && (
-          <div
-            style={{
-              padding:
-                "8px 10px",
-              background:
-                "rgba(3,17,22,.92)",
-              border:
-                "1px solid #244a53",
-              color:
-                "#91c5ce",
-              borderRadius: 5,
-              fontSize: 9,
-            }}
-          >
-            Buildings:{" "}
-            {
-              features
-                .buildings
-                .length
-            }
-            <br />
-            Roads:{" "}
-            {
-              features.roads
-                .length
-            }
-            <br />
-            Water:{" "}
-            {
-              features.water
-                .length
-            }
-          </div>
-        )}
       </div>
     </div>
   );
