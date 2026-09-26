@@ -45,9 +45,9 @@ const OVERPASS_ENDPOINTS = [
   "https://maps.mail.ru/osm/tools/overpass/api/interpreter",
 ];
 
-const MAX_BUILDINGS = 300;
-const MAX_ROADS = 160;
-const MAX_WATER = 100;
+const MAX_BUILDINGS = 500;
+const MAX_ROADS = 250;
+const MAX_WATER = 150;
 
 
 function LocationController({
@@ -167,11 +167,21 @@ function AreaSelector({
   });
 
   useEffect(() => {
-    if (!selecting) {
+    // IMPORTANT: disable Leaflet's normal touch/pan gesture BEFORE the
+    // finger starts moving. Disabling it only inside touchstart is too late
+    // on some mobile browsers because Leaflet may already have started its
+    // own drag handler. This keeps normal map dragging when not selecting.
+    if (selecting) {
+      map.dragging.disable();
+    } else {
       setStart(null);
       setCurrent(null);
       map.dragging.enable();
     }
+
+    return () => {
+      map.dragging.enable();
+    };
   }, [
     selecting,
     map,
@@ -224,7 +234,7 @@ function AreaSelector({
    OVERPASS
 ========================================================= */
 
-async function runOverpassQuery(query, endpoint, timeoutMs = 7000) {
+async function runOverpassQuery(query, endpoint, timeoutMs = 10000) {
   const controller = new AbortController();
   const timer = setTimeout(() => controller.abort(), timeoutMs);
 
@@ -251,7 +261,7 @@ async function runOverpassQuery(query, endpoint, timeoutMs = 7000) {
 
 async function queryFastestEndpoint(query) {
   const attempts = OVERPASS_ENDPOINTS.slice(0, 2).map((endpoint) =>
-    runOverpassQuery(query, endpoint, 7000)
+    runOverpassQuery(query, endpoint, 10000)
       .then((json) => ({ json, endpoint }))
   );
 
@@ -280,14 +290,14 @@ async function loadOSMFeatures(bounds) {
     - 10 second client timeout
   */
   const query = `
-    [out:json][timeout:6];
+    [out:json][timeout:9];
     (
       way["building"](${south},${west},${north},${east});
       way["highway"](${south},${west},${north},${east});
       way["natural"="water"](${south},${west},${north},${east});
       way["waterway"](${south},${west},${north},${east});
     );
-    out tags geom qt;
+    out tags geom;
   `;
 
   const { json } = await queryFastestEndpoint(query);

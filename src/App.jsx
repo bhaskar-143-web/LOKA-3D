@@ -2661,41 +2661,93 @@ async function generateHeightMap(src) {
     src.startsWith("https://")
   ) {
     /*
-      FIX: for a remote (map-selected) satellite image, fetch the bytes
-      ourselves first and load them from a local blob: URL. A blob: URL
-      is always same-origin for canvas pixel reads (ctx.getImageData),
-      which avoids CORS/crossOrigin edge cases that a plain
-      <img crossorigin="anonymous"> load can hit against some map image
-      services even when the same URL displays fine as a texture. This
-      was silently turning every map-selected area into the flat/neutral
-      fallback terrain. If the fetch itself fails (offline, blocked,
-      genuinely no CORS), fall back to the direct image load so texture
-      draping can still work even when pixel readback cannot.
-    */
-    try {
-      const response = await fetch(src, { mode: "cors" });
+      MAP-SELECTED IMAGE LOADING
+      -------------------------
+      Try the requested satellite export as bytes first. When that endpoint
+      returns an HTTP/CORS error, also try the alternate ArcGIS host. Only
+      after all fetch candidates fail do we try direct <img> loading.
 
-      if (!response.ok) {
-        throw new Error(
-          `Satellite image request failed (${response.status}).`
+      This is deliberately isolated to the image -> depth stage. The terrain
+      renderer, MapView and elevation/analysis state are not changed.
+    */
+    const candidates = [src];
+
+    // The map workflow passes the current primary URL. Reconstruct the
+    // alternate host from the same export request when possible.
+    if (src.includes("services.arcgisonline.com")) {
+      candidates.push(
+        src.replace(
+          "https://services.arcgisonline.com",
+          "https://server.arcgisonline.com"
+        )
+      );
+    } else if (src.includes("server.arcgisonline.com")) {
+      candidates.push(
+        src.replace(
+          "https://server.arcgisonline.com",
+          "https://services.arcgisonline.com"
+        )
+      );
+    }
+
+    let lastError = null;
+
+    for (const candidate of candidates) {
+      try {
+        const response = await fetch(
+          candidate,
+          {
+            mode: "cors",
+            cache: "no-store",
+          }
+        );
+
+        if (!response.ok) {
+          throw new Error(
+            `Satellite image request failed (${response.status}).`
+          );
+        }
+
+        const blob = await response.blob();
+
+        if (!blob.size) {
+          throw new Error("Satellite image response was empty.");
+        }
+
+        const blobUrl =
+          URL.createObjectURL(blob);
+
+        try {
+          img = await loadImageElement(blobUrl);
+        } finally {
+          URL.revokeObjectURL(blobUrl);
+        }
+
+        // A successfully decoded local blob is safe for canvas pixel reads.
+        break;
+      } catch (error) {
+        lastError = error;
+        console.warn(
+          "Satellite export candidate failed; trying the next endpoint.",
+          candidate,
+          error
         );
       }
+    }
 
-      const blob = await response.blob();
-      const blobUrl = URL.createObjectURL(blob);
-
+    // If byte fetching is blocked by the network, preserve the old direct
+    // image path. This can still make the satellite texture visible even
+    // when canvas-based depth extraction is unavailable.
+    if (!img) {
       try {
-        img = await loadImageElement(blobUrl);
-      } finally {
-        URL.revokeObjectURL(blobUrl);
+        img = await loadImageElement(src);
+      } catch (directError) {
+        throw new Error(
+          `Unable to load selected-area satellite imagery. ${
+            lastError?.message || directError?.message || "Unknown error"
+          }`
+        );
       }
-    } catch (fetchError) {
-      console.warn(
-        "Fetching the satellite image failed; falling back to a direct cross-origin image load.",
-        fetchError
-      );
-
-      img = await loadImageElement(src);
     }
   } else {
     img = await loadImageElement(src);
@@ -3087,15 +3139,32 @@ export default function App() {
 
   const createSatelliteImageUrl =
     (bounds) => {
+      const west = Number(bounds?.west);
+      const south = Number(bounds?.south);
+      const east = Number(bounds?.east);
+      const north = Number(bounds?.north);
+
+      if (![west, south, east, north].every(Number.isFinite)) {
+        throw new Error("Invalid selected-area bounds.");
+      }
+
+      // Keep the requested extent valid and avoid accidental reversed
+      // bounding boxes from a drag-selection. Do not alter the selected
+      // area itself; only normalize its numeric ordering for ArcGIS.
+      const minX = Math.min(west, east);
+      const maxX = Math.max(west, east);
+      const minY = Math.min(south, north);
+      const maxY = Math.max(south, north);
+
       const bbox = [
-        bounds.west,
-        bounds.south,
-        bounds.east,
-        bounds.north,
+        minX,
+        minY,
+        maxX,
+        maxY,
       ].join(",");
 
       return (
-        "https://services.arcgisonline.com/ArcGIS/" +
+        "https://server.arcgisonline.com/ArcGIS/" +
         "rest/services/World_Imagery/MapServer/export" +
         `?bbox=${bbox}` +
         "&bboxSR=4326" +
@@ -3106,6 +3175,34 @@ export default function App() {
         "&transparent=false" +
         "&f=image"
       );
+    };
+
+  const createSatelliteImageCandidates =
+    (bounds) => {
+      const primary = createSatelliteImageUrl(bounds);
+
+      // Keep the original ArcGIS host as a fallback. Some networks/CDNs
+      // serve one host correctly while returning an error from the other.
+      const bbox = [
+        Number(bounds.west),
+        Number(bounds.south),
+        Number(bounds.east),
+        Number(bounds.north),
+      ].map((value) => Number(value.toFixed(7))).join(",");
+
+      const legacy =
+        "https://services.arcgisonline.com/ArcGIS/" +
+        "rest/services/World_Imagery/MapServer/export" +
+        `?bbox=${bbox}` +
+        "&bboxSR=4326" +
+        "&size=1024,1024" +
+        "&imageSR=4326" +
+        "&adjustAspectRatio=false" +
+        "&format=jpgpng" +
+        "&transparent=false" +
+        "&f=image";
+
+      return [primary, legacy];
     };
 
   /* ---------------------------------------------------
@@ -3121,11 +3218,43 @@ export default function App() {
         return;
       }
 
-      const img = new Image();
-      img.crossOrigin = "anonymous";
-      img.onload = () => resolve(true);
-      img.onerror = () => resolve(false);
-      img.src = url;
+      const candidates = [url];
+
+      if (url.includes("services.arcgisonline.com")) {
+        candidates.push(
+          url.replace(
+            "https://services.arcgisonline.com",
+            "https://server.arcgisonline.com"
+          )
+        );
+      } else if (url.includes("server.arcgisonline.com")) {
+        candidates.push(
+          url.replace(
+            "https://server.arcgisonline.com",
+            "https://services.arcgisonline.com"
+          )
+        );
+      }
+
+      let index = 0;
+
+      const tryNext = () => {
+        if (index >= candidates.length) {
+          resolve(false);
+          return;
+        }
+
+        const img = new Image();
+        img.crossOrigin = "anonymous";
+        img.onload = () => resolve(true);
+        img.onerror = () => {
+          index += 1;
+          tryNext();
+        };
+        img.src = candidates[index];
+      };
+
+      tryNext();
     });
 
   /* ---------------------------------------------------
